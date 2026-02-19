@@ -18,6 +18,7 @@
 #include <SDL3/SDL_main.h>
 
 #include "common/CrashHandler.h"
+#include "common/Error.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
 
@@ -160,25 +161,37 @@ namespace WinRTHost
 
 static std::unique_ptr<INISettingsInterface> s_settings_interface;
 static std::unique_ptr<INISettingsInterface> s_secrets_settings_interface;
+static std::atomic_bool s_reopen_fullscreen_ui = false;
 
 BEGIN_HOTKEY_LIST(g_host_hotkeys)
 END_HOTKEY_LIST()
 
 bool WinRTHost::InitializeConfig()
 {
-	if (!EmuFolders::SetResourcesDirectory() || !EmuFolders::SetDataDirectory(nullptr))
+	Error error;
+
+	EmuFolders::SetAppRoot();
+
+	if (!EmuFolders::SetResourcesDirectory())
 		return false;
+
+	if (!EmuFolders::SetDataDirectory(&error))
+	{
+		Console.ErrorFmt("Failed to create data directory '{}': {}", EmuFolders::DataRoot, error.GetDescription());
+		return false;
+	}
 
 	CrashHandler::SetWriteDirectory(EmuFolders::DataRoot);
 
 	ImGuiManager::SetFontPath(Path::Combine(EmuFolders::Resources, "fonts" FS_OSPATH_SEPARATOR_STR "Roboto-Regular.ttf"));
 
-	const std::string path(Path::Combine(EmuFolders::Settings, "PCSX2.ini"));
+	std::string path(Path::Combine(EmuFolders::Settings, "PCSX2.ini"));
+	const bool settings_exists = FileSystem::FileExists(path.c_str());
 	Console.WriteLn("Loading config from %s.", path.c_str());
 	s_settings_interface = std::make_unique<INISettingsInterface>(std::move(path));
 	Host::Internal::SetBaseSettingsLayer(s_settings_interface.get());
 
-	if (!s_settings_interface->Load() || !VMManager::Internal::CheckSettingsVersion())
+	if (!settings_exists || !s_settings_interface->Load() || !VMManager::Internal::CheckSettingsVersion())
 	{
 		VMManager::SetDefaultSettings(*s_settings_interface, true, true, true, true, true);
 
@@ -187,14 +200,26 @@ bool WinRTHost::InitializeConfig()
 		s_settings_interface->SetIntValue("EmuCore/GS", "VsyncEnable", 1);
 
 		auto lock = Host::GetSettingsLock();
-		if (!s_settings_interface->Save())
-			Console.Error("Failed to save settings.");
+		if (!s_settings_interface->Save(&error))
+		{
+			Console.ErrorFmt("Failed to save settings '{}': {}", s_settings_interface->GetFileName(), error.GetDescription());
+			return false;
+		}
 	}
 
 	const std::string secrets_path(Path::Combine(EmuFolders::Settings, "secrets.ini"));
+	const bool secrets_settings_exists = FileSystem::FileExists(secrets_path.c_str());
+	Console.WriteLn("Loading secrets from %s.", secrets_path.c_str());
 	s_secrets_settings_interface = std::make_unique<INISettingsInterface>(secrets_path);
-	s_secrets_settings_interface->Load();
 	Host::Internal::SetSecretsSettingsLayer(s_secrets_settings_interface.get());
+	if (!secrets_settings_exists || !s_secrets_settings_interface->Load())
+	{
+		if (!s_secrets_settings_interface->Save(&error))
+		{
+			Console.ErrorFmt("Failed to save secrets '{}': {}", s_secrets_settings_interface->GetFileName(), error.GetDescription());
+			return false;
+		}
+	}
 
 	VMManager::Internal::LoadStartupSettings();
 	return true;
@@ -219,7 +244,6 @@ void Host::ReleaseRenderWindow()
 
 void Host::BeginPresentFrame()
 {
-	VMManager::Internal::VSyncOnCPUThread();
 }
 
 void Host::RequestResizeHostDisplay(s32 width, s32 height)
@@ -236,6 +260,7 @@ void Host::OnVMStarted()
 
 void Host::OnVMDestroyed()
 {
+	s_reopen_fullscreen_ui.store(true, std::memory_order_release);
 }
 
 void Host::OnVMPaused()
@@ -277,9 +302,6 @@ void Host::OnAchievementsLoginRequested(Achievements::LoginRequestReason reason)
 
 void Host::OnAchievementsLoginSuccess(char const* display_name, u32 points, u32 sc_points, u32 unread_msg)
 {
-	Host::AddOSDMessage(fmt::format("RA: Logged in as {} ({} pts, softcore: {} pts). {} unread messages.",
-							display_name, points, sc_points, unread_msg),
-		Host::OSD_INFO_DURATION);
 }
 
 #ifdef ENABLE_ACHIEVEMENTS
@@ -560,6 +582,21 @@ std::optional<WindowInfo> WinRTHost::GetPlatformWindowInfo()
 		wi.surface_scale = 1.0f;
 		wi.type = WindowInfo::Type::WinRT;
 		wi.surface_handle = reinterpret_cast<void*>(winrt::get_abi(*s_corewind));
+
+		try
+		{
+			HdmiDisplayInformation hdi = HdmiDisplayInformation::GetForCurrentView();
+			if (hdi)
+			{
+				HdmiDisplayMode mode = hdi.GetCurrentDisplayMode();
+				wi.surface_refresh_rate = static_cast<float>(mode.RefreshRate());
+			}
+		}
+		catch (...)
+		{
+		}
+		if (wi.surface_refresh_rate <= 0.0f)
+			wi.surface_refresh_rate = 60.0f;
 	}
 	else
 	{
@@ -740,7 +777,10 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView>
 					return;
 				}
 
-				VMManager::SetState(VMState::Running);
+				if (!Host::GetBoolSettingValue("UI", "StartPaused", false))
+					VMManager::SetState(VMState::Running);
+				else
+					VMManager::SetPaused(true);
 
 				MTGS::WaitForOpen();
 				InputManager::ReloadDevices();
@@ -756,7 +796,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView>
 	{
 	}
 
-	void Run()
+	const void Run()
 	{
 		s_cpu_thread_id = std::this_thread::get_id();
 
@@ -813,8 +853,14 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView>
 						break;
 
 					case VMState::Stopping:
+						VMManager::Shutdown(false);
 						WinRTHost::ProcessEventQueue();
-						return;
+						if (!MTGS::IsOpen())
+						{
+							ImGuiManager::InitializeFullscreenUI();
+							MTGS::WaitForOpen();
+						}
+						break;
 
 					default:
 						break;
@@ -822,6 +868,12 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView>
 			}
 			else
 			{
+				if (s_reopen_fullscreen_ui.exchange(false, std::memory_order_acq_rel) && !MTGS::IsOpen())
+				{
+					ImGuiManager::InitializeFullscreenUI();
+					MTGS::WaitForOpen();
+				}
+
 				WinRTHost::ProcessEventQueue();
 				InputManager::PollSources();
 			}
