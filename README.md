@@ -31,3 +31,4 @@ Compilation Guide: [Compiling XBSX2](https://wiki.sternserv.xyz/docs/development
 - [PCSX2](https://github.com/PCSX2/pcsx2) - For the base PS2 emulation with great performance
 - [SirMangler](https://github.com/SirMangler) / [TheRhysWyrill](https://github.com/TheRhysWyrill) - For rewriting PCSX2 for UWP
 - [Rockso85](https://github.com/Rockso85) / [redhood1337](https://github.com/redhood1337) / [fffathur](https://github.com/fffathur) - For asset support
+
